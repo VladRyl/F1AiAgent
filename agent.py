@@ -2,11 +2,13 @@ import fastf1
 import feedparser
 import os
 import requests
+import json
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_agent
+from auth import get_f1_fantasy_cookie, update_env_cookie, load_cached_cookie
 
 load_dotenv()
 
@@ -41,7 +43,7 @@ def get_race_results(year: int, location: str, session_type: str) -> str:
 @tool
 def get_fantasy_prices() -> str:
     """Returns current F1 Fantasy information including prices, points, and other statistics for all drivers and constructors."""
-    url = "https://fantasy.formula1.com/feeds/v2/statistics/driverconstructors_4.json"
+    url = os.getenv("FANTASY_STATS_URL")
 
     try:
         response = requests.get(url)
@@ -94,21 +96,55 @@ def get_fantasy_prices() -> str:
 
 @tool
 def get_my_fantasy_team() -> str:
-    """Returns the user's current F1 Fantasy team information."""
+    """Returns the user's current F1 Fantasy team information. Automatically refreshes cookies if needed."""
     url = os.getenv("FANTASY_TEAM_URL")
-    cookie = os.getenv("FANTASY_COOKIE")
+    cookie = load_cached_cookie()
     
+    if not url:
+        return "Error: FANTASY_TEAM_URL environment variable is not set in .env."
+
+    # If no cached cookie, try to get one
+    if not cookie:
+        print("No cached cookie found. Attempting to fetch...")
+        cookie = get_f1_fantasy_cookie()
+        if not cookie.startswith("Error"):
+            update_env_cookie(cookie)
+        else:
+            return f"Error: Failed to fetch initial cookie: {cookie}"
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Cookie": cookie
     }
-    if not url:
-        return "Error: FANTASY_TEAM_URL environment variable is not set in .env."
 
     try:
         response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.text
+        
+        # If unauthorized or forbidden, try to refresh cookie
+        if response.status_code in [401, 403]:
+            print("Cookie might be expired. Attempting to refresh...")
+            new_cookie = get_f1_fantasy_cookie()
+            if not new_cookie.startswith("Error"):
+                update_env_cookie(new_cookie)
+                # Update local headers with new cookie
+                headers["Cookie"] = new_cookie
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+            else:
+                return f"Error: Cookie expired and auto-refresh failed: {new_cookie}"
+        else:
+            response.raise_for_status()
+            
+        data = response.json()
+        
+        user_teams = data.get("Data", {}).get("Value", {}).get("userTeam", [])
+        team_2 = next((team for team in user_teams if team.get("teamno") == 2), None)
+        
+        if team_2:
+            data["Data"]["Value"]["userTeam"] = [team_2]
+            return json.dumps(data)
+        else:
+            return "Error: Team with teamno 2 not found in the response."
     except Exception as e:
         return f"Error fetching my team: {str(e)}"
 
@@ -116,8 +152,9 @@ def get_my_fantasy_team() -> str:
 @tool
 def get_f1_news() -> str:
     """Returns the latest F1 news from the Autosport RSS feed."""
+    rss_url = os.getenv("F1_NEWS_RSS")
     try:
-        feed = feedparser.parse('https://www.autosport.com/rss/feed/f1')
+        feed = feedparser.parse(rss_url)
         news_items = []
         for entry in feed.entries[:5]:
             news_items.append(f"Title: {entry.title}\nSummary: {entry.summary}\n")
@@ -136,7 +173,7 @@ def run_f1_agent(query: str):
     agent = create_agent(
         llm,
         tools=tools,
-        system_prompt=f"You are an expert Formula 1 Fantasy AI Assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. You use tools to gather actual F1 schedule, race results, latest news, and fantasy prices. You analyze this data to provide the best possible recommendations for an F1 Fantasy team strategy. Always base your advice on recent form and upcoming track characteristics. Answer clearly and concisely. Always answer strictly in Ukrainian language."
+        system_prompt=f"You are an expert Formula 1 Fantasy AI Assistant. Today's date is {datetime.now().strftime('%Y-%m-%d')}. You use tools to gather actual F1 schedule, race results, latest news, latest fantasy prices, my team, latest race news. You analyze this data to provide the best possible recommendations for an F1 Fantasy team strategy. Always base your advice on recent form and upcoming track characteristics. Answer clearly and concisely. Always answer strictly in Ukrainian language."
     )
     
     response = agent.invoke({"messages": [("user", query)]})

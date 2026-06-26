@@ -3,6 +3,7 @@ import feedparser
 import os
 import requests
 import json
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -17,6 +18,25 @@ cache_dir = "fastf1_cache"
 if not os.path.exists(cache_dir):
     os.makedirs(cache_dir)
 fastf1.Cache.enable_cache(cache_dir)
+
+def get_current_round() -> int:
+    """Calculates the current active F1 Fantasy round number dynamically based on the race schedule."""
+    try:
+        year = datetime.now().year
+        schedule = fastf1.get_event_schedule(year)
+        # Filter out pre-season testing (RoundNumber == 0)
+        schedule = schedule[schedule['RoundNumber'] > 0]
+        today = datetime.now().date()
+        future_races = schedule[schedule['EventDate'].dt.date >= today]
+        if not future_races.empty:
+            round_num = int(future_races.iloc[0]['RoundNumber'])
+        else:
+            round_num = int(schedule.iloc[-1]['RoundNumber'])
+        print(f"Dynamically determined current F1 round: {round_num}")
+        return round_num
+    except Exception as e:
+        print(f"Error determining current round: {e}")
+        return 6  # Fallback to Monaco/Sensible default
 
 @tool
 def get_f1_schedule(year: int) -> str:
@@ -98,6 +118,10 @@ def get_fantasy_prices() -> str:
 def get_my_fantasy_team() -> str:
     """Returns the user's current F1 Fantasy team information. Automatically refreshes cookies if needed."""
     url = os.getenv("FANTASY_TEAM_URL")
+    if url:
+        current_round = get_current_round()
+        url = re.sub(r'/getteam/(\d+)/(\d+)/\d+/(\d+)', rf'/getteam/\1/\2/{current_round}/\3', url)
+        print(f"Fetching user team from dynamically updated URL: {url}")
     cookie = load_cached_cookie()
     
     if not url:
@@ -113,7 +137,7 @@ def get_my_fantasy_team() -> str:
             return f"Error: Failed to fetch initial cookie: {cookie}"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Cookie": cookie
     }
 
@@ -181,7 +205,6 @@ def run_f1_agent(query: str):
     if isinstance(content, list):
         return "".join([c.get("text", "") for c in content if isinstance(c, dict) and "text" in c])
     return str(content)
-
 
 if __name__ == "__main__":
     print("Welcome to the F1 Fantasy AI Agent!")
